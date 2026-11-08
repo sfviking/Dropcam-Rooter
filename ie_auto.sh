@@ -25,6 +25,23 @@ chmod +x /tmp/dummy_connect
 # Bind-mount the dummy script over the stock Nest connect client
 mount -o bind /tmp/dummy_connect /usr/bin/connect
 
+# The bind-mount only stops NEW launches. The stock init starts the real
+# connect client early in boot (~t+12s), BEFORE this hook runs, and that
+# already-running instance disables the Wi-Fi radio (ath6kl: wlan disabled,
+# ~t+37s) and resets the link, which is why Wi-Fi never associates. Kill any
+# running connect for the first ~60s so it can never disable Wi-Fi; after that
+# the bind-mount keeps it neutered (any relaunch hits the sleep-forever dummy).
+(
+  n=0
+  while [ "$n" -lt 40 ]; do
+    for pid in $(ps | grep '[u]sr/bin/connect' | awk '{print $1}'); do
+      kill "$pid" 2>/dev/null
+    done
+    n=$((n + 1))
+    sleep 1.5
+  done
+) &
+
 # Locate and wrap wpa_supplicant to strip the blocking -W flag dynamically on boot
 if [ -f /sbin/wpa_supplicant ]; then
   WPA_PATH="/sbin/wpa_supplicant"
@@ -50,12 +67,33 @@ chmod +x /tmp/wpa_supplicant_wrapper
 # Bind-mount our wrapper over the system binary path
 mount -o bind /tmp/wpa_supplicant_wrapper "$WPA_PATH"
 
-# Run all blocking operations and loops in the background so bootstrap.sh doesn't hang
+# Feed the hardware watchdog continuously in its OWN subshell, first and
+# independent of Wi-Fi. The Ambarella watchdog resets the camera if it isn't
+# fed within its timeout (~tens of seconds). If the feed loop sits after the
+# Wi-Fi setup (as it did originally) and udhcpc/wpa_supplicant stall on an
+# interface that hasn't associated yet, the watchdog starves and the camera
+# reboot-loops. Keeping the feed first and separate guarantees the device
+# stays alive regardless of Wi-Fi state.
+(
+  while true; do
+    echo '0' > /dev/watchdog
+    sleep 10
+  done
+) &
+
+# Run Wi-Fi bring-up in its own background subshell so bootstrap.sh doesn't hang
+# and so any stall here can't affect the watchdog feed above.
 (
   # Wait for the wlan0 interface to appear
   while [ ! -e /sys/class/net/wlan0 ]; do
     sleep 0.5
   done
+
+  # Bring the interface administratively up before starting wpa_supplicant.
+  # Without this the radio stays down and wpa_supplicant reports
+  # INTERFACE_DISABLED (the stock Nest boot path normally did this, and we
+  # neutered it), so the camera never associates to Wi-Fi after a reboot.
+  ifconfig wlan0 up
 
   # Disable Wi-Fi power saving mode
   iw dev wlan0 set power_save off
@@ -65,10 +103,4 @@ mount -o bind /tmp/wpa_supplicant_wrapper "$WPA_PATH"
 
   # Request IP via DHCP once wpa_supplicant connects
   udhcpc -i wlan0 -b -R
-
-  # Feed watchdog in a loop to keep the device alive
-  while true; do
-    echo '0' > /dev/watchdog
-    sleep 10
-  done
 ) &
