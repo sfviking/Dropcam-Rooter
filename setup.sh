@@ -7,10 +7,10 @@ echo "=== Dropcam A5s Rooting Toolchain: Setup Environment ==="
 echo "[+] Installing system dependencies (mtd-utils, libusb, netcat, wget, git, make, gcc)..."
 if [ -f /usr/bin/apt-get ]; then
     echo "    Detected Debian/Ubuntu/Pop!_OS system. Please enter sudo password if prompted."
-    sudo apt-get update && sudo apt-get install -y mtd-utils libusb-1.0-0-dev netcat-openbsd wget git make gcc python3-venv
+    sudo apt-get update && sudo apt-get install -y mtd-utils libusb-1.0-0-dev pkg-config netcat-openbsd wget git make gcc python3-venv
 elif [ -f /usr/bin/dnf ]; then
     echo "    Detected Fedora system. Please enter sudo password if prompted."
-    sudo dnf install -y mtd-utils libusb1-devel netcat wget git make gcc python3
+    sudo dnf install -y mtd-utils libusb1-devel pkgconf-pkg-config netcat wget git make gcc python3
 else
     echo "[!] Unknown package manager. Please ensure 'mtd-utils', 'libusb-1.0-dev', 'netcat', 'wget', 'git', 'make', and 'gcc' are installed manually."
 fi
