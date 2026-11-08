@@ -20,6 +20,46 @@ else
     PARENT_DIR="gopro-usb-tools"
 fi
 
+# ---------------------------------------------------------------------------
+# telnet_exec: feed commands to the camera's telnet shell and block until they
+# actually finish, instead of guessing with fixed `sleep` delays.
+#
+# It appends a unique sentinel `echo` after the supplied commands and reads the
+# session output until that sentinel appears, then tears the connection down.
+# Because the remote /bin/sh runs commands synchronously, the sentinel cannot
+# print until every preceding command (including a multi-second `nandwrite`)
+# has returned -- which removes both the wasted wait on fast links and, more
+# importantly, the risk of closing telnet mid-flash and bricking the camera.
+#
+# Usage:  telnet_exec HOST [TIMEOUT_SECS] <<'CMDS'
+#            command one
+#            command two
+#          CMDS
+# Stdout is the session transcript with the sentinel line stripped.
+# ---------------------------------------------------------------------------
+telnet_exec() {
+    local host="$1"
+    local timeout_secs="${2:-60}"
+    local marker="__RC_DONE_$$_${RANDOM}__"
+    local cmds
+    cmds="$(cat)"
+
+    {
+        sleep 1            # let busybox telnetd finish option negotiation
+        printf '%s\n' "$cmds"
+        printf 'echo %s\n' "$marker"
+        printf 'exit\n'
+    } | timeout "$timeout_secs" telnet "$host" 2>/dev/null | {
+        while IFS= read -r line; do
+            case "$line" in
+                *"$marker"*) break ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done
+    }
+    return 0
+}
+
 # 2. Boot the camera into RAM first to access the storage
 echo ""
 echo "=== Step 1: Boot Camera into RAM ==="
@@ -120,23 +160,31 @@ fi
 
 # 3. Pull the stock configuration partition automatically from the camera
 echo "[+] Starting local receiver port on host..."
-# Start listener on host in background
-nc -l -p 1234 > "$PARENT_DIR/adc_stock.bin" &
+# Start listener on host in background (-l PORT form works for both
+# netcat-openbsd and nmap-ncat, the two variants setup.sh installs).
+rm -f "$PARENT_DIR/adc_stock.bin"
+nc -l 1234 > "$PARENT_DIR/adc_stock.bin" &
 NC_PID=$!
 
 echo "[+] Initializing NAND driver and dumping stock configuration partition from camera..."
-(
-  sleep 2
-  echo "echo ambarella-nand > /sys/bus/platform/drivers/ambarella-nand/bind"
-  sleep 2
-  echo "dd if=/dev/mtd9 bs=4096 | nc 10.9.9.2 1234"
-  sleep 2
-  echo "exit"
-) | telnet 10.9.9.1 || true
+# dd blocks until the whole partition is streamed; telnet_exec returns only
+# once the remote dd|nc pipeline has finished, so no blind sleeps are needed.
+telnet_exec 10.9.9.1 180 <<'EOF' >/dev/null
+echo ambarella-nand > /sys/bus/platform/drivers/ambarella-nand/bind
+dd if=/dev/mtd9 bs=4096 | nc 10.9.9.2 1234
+EOF
 
 # Wait for the transfer process to complete
-wait $NC_PID
-echo "  [✓] Configuration partition successfully dumped to host."
+wait "$NC_PID" || true
+
+# Sanity-check the dump before we rely on it as the flash template.
+DUMP_SIZE=$(wc -c < "$PARENT_DIR/adc_stock.bin" | tr -d ' ')
+if [ "${DUMP_SIZE:-0}" -lt 131072 ]; then
+    echo "[!] Error: stock dump is only ${DUMP_SIZE:-0} bytes -- the transfer failed."
+    echo "    Check the USB link and retry. Nothing has been written to the camera."
+    exit 1
+fi
+echo "  [✓] Configuration partition dumped ($DUMP_SIZE bytes) to host."
 
 # 4. Extract configuration partition template
 echo "[+] Extracting stock configuration partition template..."
@@ -198,41 +246,69 @@ chmod +x "$WORKSPACE_DIR/ie_auto.sh"
 # 8. Compile the JFFS2 partition image
 echo "[+] Compiling new JFFS2 image..."
 mkfs.jffs2 -d "$WORKSPACE_DIR" -o "$OUTPUT_DIR/adc_new.bin" -e 0x20000 --pad=3145728 -l
-echo "  [✓] Image compiled successfully at: $OUTPUT_DIR/adc_new.bin"
+HOST_MD5=$(md5sum "$OUTPUT_DIR/adc_new.bin" | awk '{print $1}')
+echo "  [✓] Image compiled successfully at: $OUTPUT_DIR/adc_new.bin (md5: $HOST_MD5)"
 
 # 9. Transfer the modified configuration back to the camera
 echo "[+] Starting local sender port on host..."
 # Start sender listener on host in background
-nc -l -p 1234 < "$OUTPUT_DIR/adc_new.bin" &
+nc -l 1234 < "$OUTPUT_DIR/adc_new.bin" &
 NC_PID=$!
 
 echo "[+] Transferring configuration image to camera..."
-(
-  sleep 2
-  echo "nc 10.9.9.2 1234 > /tmp/adc_new.bin"
-  sleep 2
-  echo "exit"
-) | telnet 10.9.9.1 || true
+telnet_exec 10.9.9.1 180 <<'EOF' >/dev/null
+nc 10.9.9.2 1234 > /tmp/adc_new.bin
+EOF
 
 # Wait for the transfer to complete
-wait $NC_PID
-echo "  [✓] Image successfully transferred to camera (/tmp/adc_new.bin)."
+wait "$NC_PID" || true
+echo "  [✓] Image transferred to camera (/tmp/adc_new.bin)."
+
+# Verify the image on the camera BEFORE erasing flash. A corrupt USB transfer
+# that gets written to mtd9 would brick the camera; bailing here leaves the
+# existing (bootable) config partition untouched.
+echo "[+] Verifying transferred image against host md5 ($HOST_MD5)..."
+VERIFY_OUT=$(telnet_exec 10.9.9.1 60 <<EOF
+if md5sum /tmp/adc_new.bin 2>/dev/null | grep -qi '^$HOST_MD5 '; then
+  echo RC_MD5_OK
+else
+  echo RC_MD5_FAIL
+  md5sum /tmp/adc_new.bin 2>/dev/null || wc -c /tmp/adc_new.bin
+fi
+EOF
+)
+if ! printf '%s\n' "$VERIFY_OUT" | grep -q RC_MD5_OK; then
+    echo "[!] Error: image on camera does not match host image (corrupt transfer)."
+    echo "    Aborting BEFORE erasing flash so the camera stays bootable. Retry."
+    printf '%s\n' "$VERIFY_OUT" | sed 's/^/      /'
+    exit 1
+fi
+echo "  [✓] Image verified on camera (md5 matches)."
 
 # 10. Erase and write flash on the Dropcam
-echo "[+] Executing flash update on Dropcam..."
-(
-  sleep 2
-  echo "/usr/sbin/flash_eraseall /dev/mtd9"
-  sleep 2
-  echo "/usr/sbin/nandwrite -p /dev/mtd9 /tmp/adc_new.bin"
-  sleep 2
-  echo "echo '=== Flashing Complete! Reboot the camera now. ==='"
-  sleep 2
-  echo "exit"
-) | telnet 10.9.9.1 || true
+echo "[+] Executing flash update on Dropcam (do NOT unplug until this finishes)..."
+# erase && write are chained so a failed erase never proceeds to a write, and
+# telnet_exec holds the session open until nandwrite+sync have truly returned.
+FLASH_OUT=$(telnet_exec 10.9.9.1 300 <<'EOF'
+if /usr/sbin/flash_eraseall /dev/mtd9 && /usr/sbin/nandwrite -p /dev/mtd9 /tmp/adc_new.bin; then
+  sync
+  echo RC_FLASH_OK
+else
+  echo RC_FLASH_FAIL
+fi
+EOF
+)
+printf '%s\n' "$FLASH_OUT" | sed 's/^/      /'
+if ! printf '%s\n' "$FLASH_OUT" | grep -q RC_FLASH_OK; then
+    echo ""
+    echo "[!] Error: flashing did not report success -- the config partition may be"
+    echo "    in an inconsistent state. The RAM kernel is still booted, so re-run the"
+    echo "    flash step now; do NOT reboot the camera until a write completes cleanly."
+    exit 1
+fi
 
 echo ""
-echo "[✓] Flashing process complete!"
+echo "[✓] Flashing process complete and verified!"
 echo "    Please unplug the camera and plug it back in to boot normally."
 echo "    The camera will be accessible on your local network at port 23 (Telnet)."
 
