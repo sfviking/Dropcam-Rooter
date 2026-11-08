@@ -1,4 +1,15 @@
 #!/bin/sh
+export PATH=/sbin:/usr/sbin:/usr/local/bin:/usr/bin:/bin
+
+# Keep one watchdog descriptor open; closing it every ten seconds produces
+# "Not stopping watchdog, V first!" messages. Start before network setup.
+(
+  exec 3>/dev/watchdog
+  while true; do
+    printf '0' >&3
+    sleep 10
+  done
+) &
 
 # Start telnetd on standard port with shell login
 /usr/sbin/telnetd -l /bin/sh &
@@ -37,53 +48,46 @@ fi
 cp "$WPA_PATH" /tmp/wpa_supplicant_real
 cat << 'EOF' > /tmp/wpa_supplicant_wrapper
 #!/bin/sh
-ARGS=""
-for arg in "$@"; do
+# Rotate the original arguments once, dropping -W without eval/re-parsing.
+remaining=$#
+while [ "$remaining" -gt 0 ]; do
+  arg=$1
+  shift
   if [ "$arg" != "-W" ]; then
-    ARGS="$ARGS \"$arg\""
+    set -- "$@" "$arg"
   fi
+  remaining=$((remaining - 1))
 done
-eval "/tmp/wpa_supplicant_real $ARGS"
+exec /tmp/wpa_supplicant_real "$@"
 EOF
 chmod +x /tmp/wpa_supplicant_wrapper
 
 # Bind-mount our wrapper over the system binary path
 mount -o bind /tmp/wpa_supplicant_wrapper "$WPA_PATH"
 
-# Feed the hardware watchdog continuously in its OWN subshell, first and
-# independent of Wi-Fi. The Ambarella watchdog resets the camera if it isn't
-# fed within its timeout (~tens of seconds). If the feed loop sits after the
-# Wi-Fi setup (as it did originally) and udhcpc/wpa_supplicant stall on an
-# interface that hasn't associated yet, the watchdog starves and the camera
-# reboot-loops. Keeping the feed first and separate guarantees the device
-# stays alive regardless of Wi-Fi state.
+# bootstrap.sh starts the supplicant after this hook returns. Starting a
+# second instance here races it: failed duplicate startup can leave wlan0 down.
 (
-  while true; do
-    echo '0' > /dev/watchdog
-    sleep 10
+  while [ ! -e /sys/class/net/wlan0 ]; do sleep 1; done
+  attempts=0
+  until wpa_cli -i wlan0 ping 2>/dev/null | grep -q PONG; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 60 ]; then
+      echo 'No stock Wi-Fi supplicant after 60 seconds' >/tmp/wifi-start.log
+      exit 1
+    fi
+    sleep 1
   done
-) &
-
-# Run Wi-Fi bring-up in its own background subshell so bootstrap.sh doesn't hang
-# and so any stall here can't affect the watchdog feed above.
-(
-  # Wait for the wlan0 interface to appear
-  while [ ! -e /sys/class/net/wlan0 ]; do
-    sleep 0.5
-  done
-
-  # Bring the interface administratively up before starting wpa_supplicant.
-  # Without this the radio stays down and wpa_supplicant reports
-  # INTERFACE_DISABLED (the stock Nest boot path normally did this, and we
-  # neutered it), so the camera never associates to Wi-Fi after a reboot.
   ifconfig wlan0 up
-
-  # Disable Wi-Fi power saving mode
   iw dev wlan0 set power_save off
-
-  # Start wpa_supplicant manually since we neutered connect and a5s_boot.sh
-  wpa_supplicant -iwlan0 -c/mnt/dropcam/wpa_supplicant.conf -Dnl80211 -B
-
-  # Request IP via DHCP once wpa_supplicant connects
   udhcpc -i wlan0 -b -R
-) &
+) >/tmp/wifi-start.log 2>&1 &
+
+# Enable only after a successful manual stream test. A failed start leaves
+# shell/network access available; it is not retried in a reboot loop.
+if [ -f /mnt/dropcam/enable_rtsp ] && [ -f /mnt/dropcam/start_rtsp.sh ]; then
+  (
+    sleep 5
+    sh /mnt/dropcam/start_rtsp.sh
+  ) >/tmp/rtsp-start.log 2>&1 &
+fi

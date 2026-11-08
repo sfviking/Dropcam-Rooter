@@ -47,60 +47,12 @@ If the camera boots up but fails to connect to the Wi-Fi AP:
 
 ---
 
-## 6. Camera reboots (or hard-resets) when starting the video stream
+## 6. Camera reboots when local video starts
 
-Symptom: shortly after running `start_rtsp.sh` / `mediaserver`, the camera
-reboots (the USB `g_ether` interface re-enumerates with a new MAC, `/tmp` is
-wiped, uptime resets). Root-caused on a Dropcam Pro (ar0330, `hwver=3`). Work
-through these in order — each was a distinct, real failure:
+On a Dropcam Pro (hardware revision 3, firmware 217), sensor detection and DSP microcode loading succeeded. The next failure occurred during thread library startup. The streaming process hit a kernel fault before it could configure the encoder. `prepare_rtsp_compat.sh` creates a checksum-verified copy of the matching library in RAM and `start_rtsp.sh` uses it for the media processes. The helper stops on an unfamiliar library build.
 
-1. **`init.sh: modprobe: not found` / "Modprobe IAV failed!"** — the rooted boot
-   leaves `/sbin` out of `PATH`, so the IAV video kernel module never loads and
-   `mediaserver` then faults on uninitialized hardware. Fix: run with
-   `PATH=/sbin:/usr/sbin:/usr/local/bin:/usr/bin:/bin` (now done in
-   `start_rtsp.sh`).
+On a camera with an existing administrative shell, place `start_rtsp.sh` and `prepare_rtsp_compat.sh` together under `/mnt/dropcam`. Run `sh /mnt/dropcam/start_rtsp.sh` and open `rtsp://<camera-ip>/stream1` in VLC. The launcher chooses the sensor-specific stock config. `mediaserver -a` starts the encoder, image processing, and RTSP processes itself.
 
-2. **`insmod: can't open 'extra/imgproc.ko'` / "Insmod failed"** — busybox
-   `modprobe` fails to resolve module dependencies from relative paths. Fix:
-   `cd /lib/modules/$(uname -r) && depmod -a` before `init.sh` (now done).
+The updated `ie_auto.sh` supports automatic startup when `/mnt/dropcam/enable_rtsp` exists. Removing this marker disables streaming on the next boot. Startup diagnostics are in `/tmp/rtsp-start.log`, `/tmp/dropcam-rtsp/`, and `/tmp/wifi-start.log`.
 
-3. **Instant hard-reset the moment `mediaserver` starts** — the encoder config
-   is sensor-specific. The HD (ov9710) uses `vin_mode 65524` (720p); the Pro
-   (ar0330) MUST use `vin_mode 30` (2304x1296). The stock per-sensor configs
-   live at `/etc/dropcam/encode.cfg` (HD) and
-   `/etc/dropcam/encode-crownroyal.cfg` (Pro — "crownroyal" is the Pro
-   codename). Feeding the HD's `vin_mode` to the ar0330 programs the VIN into an
-   immediate hardware fault. `start_rtsp.sh` now auto-selects the stock config.
-
-4. **Port 554 never opens** — RTSP is served by the separate `rtsp_server`
-   binary, which must be *started* after `mediaserver` (the old scripts only
-   `killall`-ed it). Now started by `start_rtsp.sh`.
-
-5. **Remaining blocker (Pro):** even with 1–4 fixed (sensor detected —
-   `MT9T002 sensor ID is 0x2604` — and DSP microcode loaded), `mediaserver`
-   triggers a **kernel NULL-pointer-dereference oops** in the Ambarella video
-   driver (`Unable to handle kernel NULL pointer dereference at virtual address
-   00000000`, `Process mediaserver`), and the hardware watchdog resets the box a
-   few seconds later. This is because the rooted/neutered boot does not fully
-   replicate the stock `a5s_boot`/`connect` initialization sequence the driver
-   depends on. Fixing it needs the camera's **physical serial console** (to read
-   the full oops PC/backtrace live) and reconstruction of the stock init order —
-   it is not fixable from an `encode.cfg` or any userspace tweak.
-
-### Note: the hardware watchdog is NOT the cause of these reboots
-`ie_auto.sh` feeds `/dev/watchdog` and the camera is stable for hours at idle
-and for 4+ minutes after a clean `init.sh` with no `mediaserver`. The resets
-above are the `mediaserver` kernel fault, not watchdog starvation.
-
-### Diagnostic tips used to pin this down
-* The camera's busybox `md5sum` applet is **broken** (returns wrong hashes);
-  verify transfers with `cksum` instead (confirmed correct via `cksum "abc"`).
-* busybox `wget` on the camera intermittently corrupts/segfaults on large files;
-  `scp -O` over dropbear is reliable. dropbear accepts root with **any**
-  password, which is a far more stable control channel than the auth-less
-  `telnetd -l /bin/sh` (whose shell was observed dying on connect).
-* To capture a kernel oops that a reboot would otherwise wipe, stream it off the
-  device live: on the camera `cat /proc/kmsg | nc <host> 9999`, on the host
-  `nc -l 9999 > kmsg.log`. Writing logs to NAND (`/mnt/dropcam`) with frequent
-  `sync` can itself provoke `ambarella-nand ... timeout` under load — prefer
-  network streaming or tmpfs for diagnostics.
+The tested Pro rejoined Wi-Fi and served H.264 video at 1280×720 after reboot. On the tested network, UDP playback over Wi-Fi was smoother than interleaved TCP. Use TCP when forwarding RTSP through an SSH tunnel. On Pro revision 3 with firmware 217, a daytime scene with pink foliage and sky was caused by the infrared cut filter resting in its night position. The launcher now applies the stock daytime filter pulse when video starts. This selects daytime color on startup. Automatic night switching is not implemented.
