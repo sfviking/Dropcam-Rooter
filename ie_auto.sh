@@ -50,12 +50,33 @@ chmod +x /tmp/wpa_supplicant_wrapper
 # Bind-mount our wrapper over the system binary path
 mount -o bind /tmp/wpa_supplicant_wrapper "$WPA_PATH"
 
-# Run all blocking operations and loops in the background so bootstrap.sh doesn't hang
+# Feed the hardware watchdog continuously in its OWN subshell, first and
+# independent of Wi-Fi. The Ambarella watchdog resets the camera if it isn't
+# fed within its timeout (~tens of seconds). If the feed loop sits after the
+# Wi-Fi setup (as it did originally) and udhcpc/wpa_supplicant stall on an
+# interface that hasn't associated yet, the watchdog starves and the camera
+# reboot-loops. Keeping the feed first and separate guarantees the device
+# stays alive regardless of Wi-Fi state.
+(
+  while true; do
+    echo '0' > /dev/watchdog
+    sleep 10
+  done
+) &
+
+# Run Wi-Fi bring-up in its own background subshell so bootstrap.sh doesn't hang
+# and so any stall here can't affect the watchdog feed above.
 (
   # Wait for the wlan0 interface to appear
   while [ ! -e /sys/class/net/wlan0 ]; do
     sleep 0.5
   done
+
+  # Bring the interface administratively up before starting wpa_supplicant.
+  # Without this the radio stays down and wpa_supplicant reports
+  # INTERFACE_DISABLED (the stock Nest boot path normally did this, and we
+  # neutered it), so the camera never associates to Wi-Fi after a reboot.
+  ifconfig wlan0 up
 
   # Disable Wi-Fi power saving mode
   iw dev wlan0 set power_save off
@@ -65,10 +86,4 @@ mount -o bind /tmp/wpa_supplicant_wrapper "$WPA_PATH"
 
   # Request IP via DHCP once wpa_supplicant connects
   udhcpc -i wlan0 -b -R
-
-  # Feed watchdog in a loop to keep the device alive
-  while true; do
-    echo '0' > /dev/watchdog
-    sleep 10
-  done
 ) &
